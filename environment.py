@@ -1,12 +1,18 @@
 # environment.py
 import rlcard
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import os
+import pickle
 import torch
+from treys import Card, Evaluator, Deck  # Added for Monte Carlo
+import random
 
 class PokerEnv:
-    def __init__(self):
+    RANK_SYMBOLS = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
+    SUIT_SYMBOLS = ['s', 'h', 'd', 'c']
+
+    def __init__(self, use_enhanced_observations=True):
         self.env = rlcard.make('no-limit-holdem', config={'num_players': 2})
         
         # Expand to more realistic NLHE actions
@@ -15,82 +21,60 @@ class PokerEnv:
         self.starting_stack = 100  # Starting chips for each player
         self.player_stacks = [self.starting_stack, self.starting_stack]  # Track player stacks
         
-        # Load or build equity table
+        # Track whether to use enhanced observations
+        self.use_enhanced_observations = use_enhanced_observations
+        
+        # Precompute rank and suit mappings
+        self.rank_symbols = self.RANK_SYMBOLS
+        self.suit_symbols = self.SUIT_SYMBOLS
+        
+        # Caches for efficiency
         self.preflop_equity_table = self._load_or_build_preflop_equity_table()
-        self.hand_strength_cache = {}  # Memoization cache
+        self.hand_strength_cache = OrderedDict()
+        self.cache_limit = 100000
+        self.pot_odds_cache = {}
+        self.implied_odds_cache = {}
         
         # Opponent modeling
         self.opponent_stats = {
-            'vpip': 0.0,  # Voluntary Put In Pot
-            'pfr': 0.0,   # Pre-flop Raise
-            'hands': 0,
-            'fold_to_bet': 0.0,
-            'bets_seen': 0
+            'vpip_count': 0, 'pfr_count': 0, 'hands': 0, 'fold_to_bet_count': 0, 'bets_seen': 0,
+            'aggression_factor': 0.0, 'postflop_tightness': 0.0
         }
+        
+        # Monte Carlo setup
+        self.evaluator = Evaluator()
 
-    def _load_or_build_preflop_equity_table(self, filepath="preflop_equity_table.pth", force_rebuild=False):
-        """
-        Load preflop equity table from file if exists and is compatible, otherwise build and save it.
-        """
-        TABLE_VERSION = "1.0"  # Add versioning for future compatibility
-        if os.path.exists(filepath) and not force_rebuild:
+    def _load_or_build_preflop_equity_table(self, filepath="preflop_equity_table.pkl"):
+        if os.path.exists(filepath):
             try:
-                data = torch.load(filepath)
-                if isinstance(data, dict) and data.get("version") == TABLE_VERSION:
-                    print(f"Loaded preflop equity table (v{TABLE_VERSION}) from {filepath}")
-                    return data["equity_table"]
-                else:
-                    print(f"Version mismatch or invalid data in {filepath}. Rebuilding...")
+                with open(filepath, 'rb') as f:
+                    print(f"Loaded preflop equity table from {filepath}")
+                    return pickle.load(f)
             except Exception as e:
                 print(f"Error loading equity table: {e}. Rebuilding...")
-        else:
-            print(f"{'Rebuilding' if force_rebuild else 'No'} preflop equity table found. Building a new one...")
-
-        equity_table = self._build_preflop_equity_table()
+        
+        print("Building preflop equity table...")
+        equity_table = {}
+        pair_equities = np.linspace(0.50, 0.85, 13)
+        for rank, equity in enumerate(pair_equities):
+            equity_table[tuple(sorted([f"{self.RANK_SYMBOLS[rank]}s", f"{self.RANK_SYMBOLS[rank]}h"]))] = float(equity)
+        for high_rank in range(12, -1, -1):
+            high = self.RANK_SYMBOLS[high_rank]
+            for low_rank in range(high_rank - 1, -1, -1):
+                low = self.RANK_SYMBOLS[low_rank]
+                base_equity = 0.35 + (high_rank / 36)
+                gap = high_rank - low_rank
+                suited_bonus = 0.08 if gap <= 4 else 0
+                equity_table[tuple(sorted([f"{high}s", f"{low}s"]))] = float(min(0.80, base_equity + suited_bonus))
+                equity_table[tuple(sorted([f"{high}s", f"{low}h"]))] = float(min(0.75, base_equity + suited_bonus - 0.06))
+        
         try:
-            torch.save({"version": TABLE_VERSION, "equity_table": equity_table}, filepath)
-            print(f"Saved preflop equity table (v{TABLE_VERSION}) to {filepath}")
+            with open(filepath, 'wb') as f:
+                pickle.dump(equity_table, f)
+                print(f"Saved preflop equity table to {filepath}")
         except Exception as e:
             print(f"Error saving equity table: {e}")
-        return equity_table
-
-    def _build_preflop_equity_table(self):
-        """
-        Build a preflop equity table for all 169 unique hands.
-        These are simplified but more realistic approximations based on common poker equity data.
-        """
-        equity_table = {}
-        suits = ['s', 'h', 'd', 'c']
-        rank_symbols = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
         
-        # Pre-computed approximate equities vs. a random hand (based on typical poker data)
-        # Pairs: 22 (~50%) to AA (~85%)
-        pair_equities = np.linspace(0.50, 0.85, 13)  # 13 pairs
-        for rank, equity in enumerate(pair_equities):
-            rank_symbol = rank_symbols[rank]
-            pair_key = tuple(sorted([f"{rank_symbol}s", f"{rank_symbol}h"]))
-            equity_table[pair_key] = float(equity)  # Make sure it's a Python float for compatibility
-
-        # Non-pairs (suited and offsuit)
-        for high_rank in range(12, -1, -1):  # A (12) to 2 (0)
-            high_symbol = rank_symbols[high_rank]
-            for low_rank in range(high_rank - 1, -1, -1):
-                low_symbol = rank_symbols[low_rank]
-                
-                # Suited hands (e.g., AKs, AQs)
-                suited_key = tuple(sorted([f"{high_symbol}s", f"{low_symbol}s"]))
-                # Base equity: higher card dominates, adjusted for connectedness
-                base_equity = 0.35 + (high_rank / 36)  # ~0.35 to ~0.69
-                gap = high_rank - low_rank
-                suited_bonus = 0.08 if gap <= 4 else 0  # Connectedness bonus
-                suited_equity = base_equity + suited_bonus
-                equity_table[suited_key] = float(min(0.80, max(0.35, suited_equity)))
-                
-                # Offsuit hands (e.g., AKo, AQo)
-                offsuit_key = tuple(sorted([f"{high_symbol}s", f"{low_symbol}h"]))
-                offsuit_equity = suited_equity - 0.06  # Offsuit penalty
-                equity_table[offsuit_key] = float(min(0.75, max(0.30, offsuit_equity)))
-
         return equity_table
 
     def reset(self):
@@ -136,22 +120,28 @@ class PokerEnv:
         if action in [1, 2, 3, 4, 6]:  # Any action that commits chips
             self.chips_committed = player.in_chips
         
-        # Update opponent modeling stats
+        # Update opponent stats incrementally
         if self.street == 0:
             if opponent.in_chips > 0:
-                # Opponent has voluntarily put money in pot
-                self.opponent_stats['vpip'] = ((self.opponent_stats['vpip'] * self.opponent_stats['hands']) + 1) / (self.opponent_stats['hands'] + 1)
-            
-            if opponent.in_chips > 2:  # More than BB - opponent raised
-                self.opponent_stats['pfr'] = ((self.opponent_stats['pfr'] * self.opponent_stats['hands']) + 1) / (self.opponent_stats['hands'] + 1)
-        
-        # Track opponent fold behavior
-        if action in [2, 3, 4, 6] and opponent.status == 'folded':  # We bet/raised and opponent folded
-            self.opponent_stats['fold_to_bet'] = ((self.opponent_stats['fold_to_bet'] * self.opponent_stats['bets_seen']) + 1) / (self.opponent_stats['bets_seen'] + 1)
+                self.opponent_stats['vpip_count'] += 1
+            if opponent.in_chips > 2:
+                self.opponent_stats['pfr_count'] += 1
+        if action in [2, 3, 4, 6]:
             self.opponent_stats['bets_seen'] += 1
+            if opponent.status == 'folded':
+                self.opponent_stats['fold_to_bet_count'] += 1
+            self.opponent_stats['aggression_factor'] = (
+                (self.opponent_stats['aggression_factor'] * (self.opponent_stats['bets_seen'] - 1) + 1) /
+                self.opponent_stats['bets_seen']
+            )
+        if done and self.street > 0 and opponent.status == 'folded':
+            self.opponent_stats['postflop_tightness'] = (
+                (self.opponent_stats['postflop_tightness'] * self.opponent_stats['hands'] + 1) /
+                (self.opponent_stats['hands'] + 1)
+            )
         
-        # Calculate equity and pot odds once
-        equity = self._calculate_equity(next_obs['obs'])
+        # Calculate equity and pot odds once, passing action for Monte Carlo decisions
+        equity = self._calculate_equity(next_obs['obs'], action=action)
         pot_odds = self._calculate_pot_odds(next_obs['obs'])
         
         reward_scaling_factor = 0.1  # Parameterize for tuning
@@ -165,7 +155,7 @@ class PokerEnv:
             pot_ratio = pot_size / (self.starting_stack * 2)
             
             if raw_reward > 0:
-                reward += reward_scaling_factor * pot_ratio
+                reward += reward_scaling_factor * pot_ratio * equity
                 
                 # Check if hand ended due to fold
                 fold_detected = any(p.status == 'folded' for p in game.players)
@@ -173,7 +163,7 @@ class PokerEnv:
                 # Reward exploiting opponent folds more intelligently
                 if fold_detected:
                     # Higher reward for successful bluffs (lower equity hands)
-                    reward += reward_scaling_factor * 2 * (1 - equity) if equity < 0.3 else reward_scaling_factor / 2
+                    reward += reward_scaling_factor * (1 - equity) * 1.5
                 else:
                     # Reward for value betting strong hands that get called/shown down
                     reward += reward_scaling_factor * equity if equity > 0.6 else 0
@@ -209,7 +199,8 @@ class PokerEnv:
                     
                 elif action == 1:  # Calling
                     # Getting the right price to call
-                    if equity >= pot_odds - 0.05:
+                    implied_odds = self._calculate_implied_odds(next_obs['obs'])
+                    if equity >= min(pot_odds, implied_odds) - 0.05:
                         reward += 0.03
                     else:
                         reward -= 0.03
@@ -232,11 +223,11 @@ class PokerEnv:
                 elif action in [2, 3, 4]:  # Various raise sizes
                     # Value betting vs bluffing considerations
                     if equity > pot_odds + 0.2:
-                        reward += 0.06  # Good value bet
-                    elif equity < pot_odds - 0.1 and self.opponent_stats['fold_to_bet'] > 0.5:
-                        reward += 0.04  # Good bluff against folding opponent
+                        reward += 0.08 * (equity - pot_odds)
+                    elif equity < pot_odds - 0.1 and self._get_fold_to_bet() > 0.5:
+                        reward += 0.06
                     elif equity < pot_odds - 0.15:
-                        reward -= 0.03  # Poor bluff against calling station
+                        reward -= 0.04
                 
                 elif action == 1:  # Calling
                     # Calling with correct odds (including implied)
@@ -272,8 +263,27 @@ class PokerEnv:
         return next_state, reward, done
 
     def _get_obs(self, obs):
-        full_obs = obs['obs']  # shape (54,)
-        # Get legal actions directly from the observation
+        if self.use_enhanced_observations:
+            # Calculate opponent stats ratios, handling division by zero
+            hands = self.opponent_stats['hands']
+            vpip = self.opponent_stats['vpip_count'] / hands if hands > 0 else 0.0
+            pfr = self.opponent_stats['pfr_count'] / hands if hands > 0 else 0.0
+            bets_seen = self.opponent_stats['bets_seen']
+            fold_to_bet = self.opponent_stats['fold_to_bet_count'] / bets_seen if bets_seen > 0 else 0.0
+            aggression_factor = self.opponent_stats['aggression_factor']
+            postflop_tightness = self.opponent_stats['postflop_tightness']
+            
+            # Enhanced observation with stack sizes, chips committed, and opponent stats
+            full_obs = np.concatenate([
+                obs['obs'],
+                [self.player_stacks[0] / self.starting_stack, self.player_stacks[1] / self.starting_stack],
+                [self.chips_committed / self.starting_stack],
+                [vpip, pfr, fold_to_bet, aggression_factor, postflop_tightness]
+            ])
+        else:
+            # Original observation for compatibility with existing models
+            full_obs = obs['obs']
+        
         legal_actions = list(self._get_legal_actions(obs).keys())
         return full_obs, legal_actions
 
@@ -378,6 +388,8 @@ class PokerEnv:
             result = np.clip(strength, 0.0, 1.0)
         
         # Cache the result
+        if len(self.hand_strength_cache) >= self.cache_limit:
+            self.hand_strength_cache.popitem(last=False)
         self.hand_strength_cache[obs_key] = result
         return result
 
@@ -489,10 +501,12 @@ class PokerEnv:
         # In a 2-player game, player 1 is typically the big blind in the first round
         return self.player_id == 1
 
-    def _calculate_equity(self, obs):
+    def _calculate_equity(self, obs, action=None):
         """
-        equity calculation using lookup tables for preflop
-        and simplified Monte Carlo for postflop
+        Equity calculation with selective Monte Carlo for critical decisions:
+        - All-in (action == 6)
+        - River (street == 3)
+        Otherwise uses preflop lookup or heuristic postflop estimation.
         """
         if self.street == 0:
             # Use pre-computed lookup table for preflop
@@ -512,32 +526,129 @@ class PokerEnv:
             
             # Get equity from table or estimate if not found
             return self.preflop_equity_table.get(card_key, 0.5)
+        
+        # Critical decision check: Use Monte Carlo for all-in or river
+        if action == 6 or self.street == 3:
+            hole_cards = [Card.new(f"{self._rank_to_symbol(r)}{self._suit_to_symbol(s)}") 
+                         for r, s in self._get_hole_cards(obs)]
+            board = [Card.new(f"{self._rank_to_symbol(r)}{self._suit_to_symbol(s)}") 
+                         for r, s in self._get_board_cards(obs)]
+            return self._monte_carlo_equity(hole_cards, board)
+        
+        # Default postflop: Heuristic estimation
+        hand_strength = self._estimate_hand_strength(obs)
+        
+        # Adjust hand strength based on community cards
+        game = self.env.game
+        num_community = len(game.public_cards)
+        
+        # As more community cards are revealed, hand strength becomes more accurate
+        confidence_factor = 0.6 + (num_community * 0.1)  # 0.9 by river
+        
+        # Scale hand strength toward true equity and adjust for opponent tendencies
+        equity = hand_strength * confidence_factor
+        
+        # Adjust equity based on opponent stats
+        if self.opponent_stats['hands'] > 10:  # Only use once we have data
+            vpip = self.opponent_stats['vpip_count'] / self.opponent_stats['hands']
+            if vpip < 0.3:  # Tight opponent
+                # They likely have stronger hands when they play
+                equity *= 0.85
+            elif vpip > 0.6:  # Loose opponent
+                # They likely have weaker hands when they play
+                equity *= 1.15
+        
+        return min(1.0, max(0.0, equity))
+    
+    def _monte_carlo_equity(self, hole_cards, board):
+        #print("Monte Carlo used")
+        """Lightweight Monte Carlo simulation for critical decisions"""
+        deck = Deck()
+        for c in hole_cards + board:
+            if c in deck.cards:  # Check if the card is in the deck
+                deck.cards.remove(c)
+        
+        # Create opponent range: Top 20%, adjusted by VPIP if data exists
+        opp_range = []
+        for r in self.RANK_SYMBOLS[-5:]:  # Top 5 ranks (T,J,Q,K,A)
+            for s in self.SUIT_SYMBOLS:
+                card = r + s
+                try:
+                    card_obj = Card.new(card)
+                    if card_obj not in hole_cards + board:
+                        opp_range.append(card_obj)
+                except:
+                    continue
+        
+        # Adjust opponent range based on collected stats
+        if self.opponent_stats['hands'] > 10:
+            vpip = self.opponent_stats['vpip_count'] / self.opponent_stats['hands']
+            new_range = []
+            for c in opp_range:
+                rank_int = Card.get_rank_int(c)
+                if (vpip < 0.3 and rank_int >= 8) or (vpip > 0.6) or (0.3 <= vpip <= 0.6 and random.random() < 0.5):
+                    new_range.append(c)
+            opp_range = new_range if new_range else opp_range  # Fallback if range becomes empty
+        
+        wins, ties, total = 0, 0, 200  # 200 rollouts for speed
+        remaining = deck.cards.copy()
+        valid_simulations = 0
+        
+        for _ in range(total):
+            if len(opp_range) < 2 or len(remaining) < (5 - len(board)):
+                break
+                
+            # Sample opponent cards from range
+            try:
+                suitable_cards = [c for c in opp_range if c in remaining]
+                if len(suitable_cards) < 2:
+                    continue
+                opp_cards = random.sample(suitable_cards, 2)
+            except ValueError:
+                # Not enough cards in range and remaining deck
+                continue
+            
+            # Remove opponent cards from remaining
+            temp_remaining = [c for c in remaining if c not in opp_cards]
+            
+            # Check if we have enough cards to complete the board
+            cards_needed = max(0, 5 - len(board))  # Never add negative number of cards
+            if len(temp_remaining) < cards_needed:
+                continue
+            
+            # Complete the board - make sure we have exactly 5 board cards total
+            if cards_needed > 0:
+                additional_cards = random.sample(temp_remaining, cards_needed)
+                full_board = board + additional_cards
+            else:
+                full_board = board[:5]  # If we already have 5+ cards, use only the first 5
+            
+            # Make sure we only pass 5 board cards to evaluator
+            if len(full_board) > 5:
+                full_board = full_board[:5]
+            
+            # Evaluate hands
+            try:
+                my_rank = self.evaluator.evaluate(full_board, hole_cards)
+                opp_rank = self.evaluator.evaluate(full_board, opp_cards)
+                
+                if my_rank < opp_rank:  # Lower is better in Treys
+                    wins += 1
+                elif my_rank == opp_rank:
+                    ties += 1
+                
+                valid_simulations += 1
+            except Exception as e:
+                # Skip problematic evaluations
+                continue
+        
+        # Return equity with fallback
+        if valid_simulations > 0:
+            return (wins + ties / 2) / valid_simulations
         else:
-            # For postflop, use a simplified model since true Monte Carlo
-            # would be computationally expensive
-            hand_strength = self._estimate_hand_strength(obs)
+            # Fallback to heuristic if Monte Carlo fails
+            return 0.5
             
-            # Adjust hand strength based on community cards
-            game = self.env.game
-            num_community = len(game.public_cards)
-            
-            # As more community cards are revealed, hand strength becomes more accurate
-            confidence_factor = 0.6 + (num_community * 0.1)  # 0.9 by river
-            
-            # Scale hand strength toward true equity and adjust for opponent tendencies
-            equity = hand_strength * confidence_factor
-            
-            # Adjust equity based on opponent stats
-            if self.opponent_stats['hands'] > 10:  # Only use once we have data
-                if self.opponent_stats['vpip'] < 0.3:  # Tight opponent
-                    # They likely have stronger hands when they play
-                    equity *= 0.9
-                elif self.opponent_stats['vpip'] > 0.6:  # Loose opponent
-                    # They likely have weaker hands when they play
-                    equity *= 1.1
-            
-            return min(1.0, max(0.0, equity))
-
     def _get_hole_cards(self, obs):
         """Extract hole cards from observation"""
         card_obs = obs[:52]
@@ -554,10 +665,44 @@ class PokerEnv:
         game = self.env.game
         board_cards = []
         for card in game.public_cards:
-            # Convert RLCard's card format to our (rank, suit) format
-            # This is a simplified version - actual conversion depends on RLCard's format
-            rank = card.rank
-            suit = card.suit
+            # RLCard uses a different card representation
+            # Convert to our (rank, suit) format with integers
+            if hasattr(card, 'card_idx'):
+                # RLCard sometimes uses card_idx format
+                card_idx = card.card_idx
+                rank = card_idx // 4  # Integer division to get rank (0-12)
+                suit = card_idx % 4   # Remainder to get suit (0-3)
+            else:
+                # Try direct rank/suit access, ensuring we have integers
+                try:
+                    # If card has rank/suit as strings like 'A', 'hearts'
+                    if isinstance(card.rank, str):
+                        rank_map = {'2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5, '8': 6, 
+                                   '9': 7, 'T': 8, 'J': 9, 'Q': 10, 'K': 11, 'A': 12}
+                        rank = rank_map.get(card.rank, 0)
+                    else:
+                        rank = int(card.rank)
+                    
+                    if isinstance(card.suit, str):
+                        suit_map = {'s': 0, 'h': 1, 'd': 2, 'c': 3, 
+                                   'spades': 0, 'hearts': 1, 'diamonds': 2, 'clubs': 3}
+                        suit = suit_map.get(card.suit, 0)
+                    else:
+                        suit = int(card.suit)
+                except (AttributeError, ValueError):
+                    # Fallback: extract from string representation
+                    # Assumes card might have a string representation like "Ah"
+                    card_str = str(card)
+                    rank_char = card_str[0]
+                    suit_char = card_str[1] if len(card_str) > 1 else 's'
+                    
+                    rank_map = {'2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5, '8': 6, 
+                               '9': 7, 'T': 8, 'J': 9, 'Q': 10, 'K': 11, 'A': 12}
+                    suit_map = {'s': 0, 'h': 1, 'd': 2, 'c': 3}
+                    
+                    rank = rank_map.get(rank_char, 0)
+                    suit = suit_map.get(suit_char, 0)
+            
             board_cards.append((rank, suit))
         return board_cards
 
@@ -579,7 +724,7 @@ class PokerEnv:
         stack_to_pot = effective_stack / max(1, pot_size)
         
         # Use opponent modeling to adjust implied odds
-        opp_fold_tendency = self.opponent_stats['fold_to_bet'] if self.opponent_stats['bets_seen'] > 5 else 0.3
+        opp_fold_tendency = self._get_fold_to_bet()
         
         # Base implied odds are better than pot odds if we're drawing
         # and have deep stacks relative to the pot
@@ -639,7 +784,7 @@ class PokerEnv:
             
         elif action in [2, 3, 4]:  # Raising
             # EV of raising = fold equity + continue equity
-            fold_equity = self.opponent_stats['fold_to_bet'] if self.opponent_stats['bets_seen'] > 5 else 0.3
+            fold_equity = self._get_fold_to_bet()
             
             # When we raise, we want high fold equity when our hand is weak
             # and high continue equity when our hand is strong
@@ -663,3 +808,5 @@ class PokerEnv:
             return ev
             
         return 0  # Default
+    def _get_fold_to_bet(self):
+        return self.opponent_stats['fold_to_bet_count'] / self.opponent_stats['bets_seen'] if self.opponent_stats['bets_seen'] > 5 else 0.3

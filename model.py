@@ -6,22 +6,22 @@ class DQN(nn.Module):
     def __init__(self, input_size, output_size):
         super(DQN, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_size, 256),
+            nn.Linear(input_size, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
             nn.LayerNorm(256),
             nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.LayerNorm(128),
-            nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(128, 64),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(64, output_size)
+            nn.Linear(128, output_size)
         )
 
     def forward(self, x):
         return self.net(x)
 
-def init_model(input_size=54, output_size=5, device='cpu'):
+def init_model(input_size=57, output_size=7, device='cpu'):
     model = DQN(input_size, output_size).to(device)
     for module in model.modules():
         if isinstance(module, nn.Linear):
